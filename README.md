@@ -110,3 +110,5 @@ GPL-2.0
 
 - Original driver: Sam Revitch (2007), Alexander Hixon (2008)
 - V4L2/videobuf2 port: Tires (2025)
+
+> V4L2 port cost: 35M tokens · 10 kWh · 1,983 tool calls
