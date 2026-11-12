@@ -56,14 +56,21 @@
 #include <linux/dmi.h>
 #include <linux/ctype.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 #include "usbcam/usbcam.h"
+#include "usbcam/usbcam_priv.h"
 
 
 #define USBCAM_DBG_R5U_INIT	(USBCAM_DBGBIT_MD_START + 0)
 #define USBCAM_DBG_R5U_FRAME	(USBCAM_DBGBIT_MD_START + 1)
 #define USBCAM_DBG_R5U_MDINTF	(USBCAM_DBGBIT_MD_START + 2)
 #define USBCAM_DBG_R5U_CTRL	(USBCAM_DBGBIT_MD_START + 3)
+
+#define R5U_INIT	USBCAM_DBG_R5U_INIT
+#define R5U_FRAME	USBCAM_DBG_R5U_FRAME
+#define R5U_MDINTF	USBCAM_DBG_R5U_MDINTF
+#define R5U_CTRL	USBCAM_DBG_R5U_CTRL
 
 
 #define r5u_info(RV, FMT...) usbcam_info((RV)->vh_parent, FMT)
@@ -157,8 +164,8 @@ struct r5u870_ctx {
 	int vh_agc;
 };
 
-#define udp_r5u870(UDP) ((struct r5u870_ctx *)((UDP)->ud_minidrv_data))
-#define r5u870_dev(RV) ((RV)->vh_parent->ud_dev)
+#define udp_r5u870(UDP) ((struct r5u870_ctx *)((UDP)->minidrv_data))
+#define r5u870_dev(RV) ((RV)->vh_parent->udev)
 
 /*
  * USB control message with kmalloc'd buffer helper
@@ -233,7 +240,7 @@ static int r5u870_get_ctrl(struct usbcam_dev *udp,
 
 static int r5u870_query_ctrl(struct usbcam_dev *udp,
 				 const struct usbcam_ctrl *basep,
-				 struct v4l2_queryctrl *c)
+				 struct v4l2_query_ext_ctrl *c)
 {
 	struct r5u870_ctx *vhp = udp_r5u870(udp);
 	struct r5u870_ctrl *ctrlp = container_of(basep, struct r5u870_ctrl,
@@ -252,23 +259,29 @@ static int r5u870_set_controls(struct r5u870_ctx *vhp, int dflt)
 {
 	const struct r5u870_ctrl *ctrlp;
 	struct v4l2_ext_control cv;
-	int res;
+	int res, i;
 
 	res = 0;
-	list_for_each_entry(ctrlp, &vhp->vh_parent->ud_ctrl_list,
-				base.uc_links) {
-		cv.id = ctrlp->base.uc_v4l.id;
+	for (i = 0; i < vhp->vh_parent->ctrls_len; i++) {
+		ctrlp = (const struct r5u870_ctrl *)&vhp->vh_parent->ctrls[i];
+		cv.id = ctrlp->base.base.id;
 
 		if (dflt)
-			cv.value = ctrlp->base.uc_v4l.default_value;
+			cv.value = ctrlp->base.base.default_value;
 		else
 			cv.value = ctrlp->value;
 
 		res = ctrlp->base.set_fn(vhp->vh_parent,
 					 &ctrlp->base,
 					 &cv);
-		if (res)
+		if (res) {
+			if (res == -EINVAL) {
+				r5u_dbg(vhp, R5U_CTRL, "control %s: set not supported, skipping\n",
+					ctrlp->base.base.name);
+				continue;
+			}
 			break;
+		}
 	}
 
 	if (vhp->vh_ctrl_reg_enable &&
@@ -292,12 +305,14 @@ static int r5u870_set_gen_reg(struct r5u870_ctx *vhp,
 	if (res < 0) {
 		r5u_err(vhp, "set_gen_reg %04x/%04x/%04x failed: %d",
 			cmd, reg, val, res);
-	    // XXX: Only commented for debugging. UNCOMMENT BEFORE RELEASE!
-        /*3pei*/
 		return res;
 	}
 	return 0;
 }
+
+static char *fw_name = NULL;
+module_param(fw_name, charp, 0444);
+MODULE_PARM_DESC(fw_name, "Override firmware filename (without /lib/firmware/ prefix)");
 
 /*
  * Send the power-up init sequence, in case it is needed.
@@ -314,19 +329,24 @@ static int r5u870_microcode_upload(struct r5u870_ctx *vhp)
 	if (!pgbuf)
 		return -ENOMEM;
 
-	r5u_dbg(vhp, R5U_INIT, "loading microcode file \"%s\"",
-		vhp->vh_model->rm_ucode_file);
+	{
+		const char *fw_to_load = (fw_name && fw_name[0]) ? fw_name
+								 : vhp->vh_model->rm_ucode_file;
 
-	res = request_firmware(&fws,
-				   vhp->vh_model->rm_ucode_file,
-				   &vhp->vh_parent->ud_dev->dev);
+		r5u_dbg(vhp, R5U_INIT, "loading microcode file \"%s\"",
+			fw_to_load);
 
-	if (res) {
-		r5u_err(vhp, "Microcode file \"%s\" is missing",
-			vhp->vh_model->rm_ucode_file);
-		r5u_err(vhp, "Please see http://wiki.mediati.org/r5u870/Microcode");
-		kfree(pgbuf);
-		return res;
+		res = request_firmware(&fws,
+					   fw_to_load,
+					   &vhp->vh_parent->udev->dev);
+
+		if (res) {
+			r5u_err(vhp, "Microcode file \"%s\" is missing",
+				fw_to_load);
+			r5u_err(vhp, "Please see http://wiki.mediati.org/r5u870/Microcode");
+			kfree(pgbuf);
+			return res;
+		}
 	}
 
 	i = 0;
@@ -364,7 +384,7 @@ static int r5u870_microcode_upload(struct r5u870_ctx *vhp)
 		rem -= len;
 
 	retry:
-		/* TODO: Maybe make this use r5u870_control_msg or similar? */
+		/* TODO: Consider refactoring to use r5u870_control_msg(). */
 		res = usb_control_msg(r5u870_dev(vhp),
 					  usb_sndctrlpipe(r5u870_dev(vhp), 0),
 					  0xa0,
@@ -449,7 +469,7 @@ static int r5u870_microcode_reset(struct r5u870_ctx *vhp)
 {
 	int res;
 	r5u_dbg(vhp, R5U_INIT, "sending microcode reset command");
-	msleep(100);		/* The Windows driver waits 1sec */
+	msleep(1000);		/* The Windows driver waits 1sec */
 	res = r5u870_set_gen_reg(vhp, 0xa6, 0, 0);
 	if (!res)
 		msleep(200);
@@ -486,17 +506,29 @@ static int r5u870_dev_init(struct r5u870_ctx *vhp)
 
 
 	if (res == -ENOENT) {
+		/* Try a microcode reset first to clear any internal state */
+		r5u_dbg(vhp, R5U_INIT, "attempting microcode reset before upload");
+		r5u870_microcode_reset(vhp);
+		msleep(1000);
+
 		res = r5u870_microcode_upload(vhp);
 		if (res < 0)
 			return res;
 
+		msleep(5000);  /* Allow chip to process uploaded firmware */
+
+		/* Enable the microcode and verify the version */
 		res = r5u870_microcode_enable(vhp);
-		if (res)
+		if (res) {
+			r5u_err(vhp, "microcode enable (0xa1) failed: %d", res);
 			return res;
+		}
 
 		res = r5u870_microcode_get_ver(vhp, &mcver);
-		if (res)
+		if (res) {
+			r5u_err(vhp, "microcode version check failed: %d", res);
 			return res;
+		}
 	}
 
 	if (mcver != vhp->vh_model->rm_ucode_version)
@@ -705,14 +737,14 @@ static int r5u870_decide_pkt_wdm(struct r5u870_ctx *vhp, int pktstatus,
 				/* Frame was previously aborted */
 				ret = -EPIPE;
 			} else if (vhp->vh_frame_accum ==
-				   vhp->vh_parent->ud_format.sizeimage) {
+				   vhp->vh_parent->curfmt->sizeimage) {
 				/* Complete frame */
 				ret = 0;
 			} else {
 				/* Not enough data in frame sequence */
 				r5u_dbg(vhp, R5U_FRAME, "frame abort: "
 					"Frame seq too short (exp:%d got:%d)",
-					vhp->vh_parent->ud_format.sizeimage,
+					vhp->vh_parent->curfmt->sizeimage,
 					vhp->vh_frame_accum);
 				ret = -EPIPE;
 			}
@@ -739,8 +771,8 @@ static int r5u870_decide_pkt_wdm(struct r5u870_ctx *vhp, int pktstatus,
 			/* Frame was previously aborted */
 			ret = -EPIPE;
 		} else if ((vhp->vh_frame_accum + pktlen) <=
-				vhp->vh_parent->ud_format.sizeimage) {
-			/* Append this data */
+vhp->vh_parent->curfmt->sizeimage) {
+		/* Append this data */
 			vhp->vh_frame_accum += pktlen;
 		} else {
 			/* Oversized frame, abort */
@@ -757,11 +789,11 @@ static int r5u870_decide_pkt_wdm(struct r5u870_ctx *vhp, int pktstatus,
 static int r5u870_set_manual_ctrls_wdm(struct r5u870_ctx *vhp, int auto_offset)
 {
 	const struct r5u870_ctrl *ctrlp;
-	int val, res;
+	int val, res, i;
 
 	res = 0;
-	list_for_each_entry(ctrlp, &vhp->vh_parent->ud_ctrl_list,
-				base.uc_links) {
+	for (i = 0; i < vhp->vh_parent->ctrls_len; i++) {
+		ctrlp = (const struct r5u870_ctrl *)&vhp->vh_parent->ctrls[i];
 		if (ctrlp->auto_offset != auto_offset)
 			continue;
 		if (!vhp->vh_ctrl_reg_enable) {
@@ -772,7 +804,7 @@ static int r5u870_set_manual_ctrls_wdm(struct r5u870_ctx *vhp, int auto_offset)
 		val = ctrlp->value;
 
 		r5u_dbg(vhp, R5U_CTRL, "control %s/wdm %02x <= %d [manual]",
-			ctrlp->base.uc_v4l.name, ctrlp->reg, val);
+			ctrlp->base.base.name, ctrlp->reg, val);
 		res = r5u870_set_reg_wdm(vhp, ctrlp->reg, val);
 		if (res)
 			break;
@@ -795,16 +827,16 @@ static int r5u870_set_ctrl_wdm(struct usbcam_dev *udp,
 
 	if (auto_ctrl && vhp->vh_ctrl_auto_suppress) {
 		r5u_dbg(vhp, R5U_CTRL, "control %s <= %d [auto suppress]",
-			ctrlp->base.uc_v4l.name, c->value);
+			ctrlp->base.base.name, c->value);
 
 	} else if (!vhp->vh_ctrl_reg_enable) {
 		r5u_dbg(vhp, R5U_CTRL, "control %s <= %d [capture off]",
-			ctrlp->base.uc_v4l.name, c->value);
+			ctrlp->base.base.name, c->value);
 		vhp->vh_ctrl_sync = 0;
 
 	} else {
 		r5u_dbg(vhp, R5U_CTRL, "control %s/wdm %02x <= %d",
-			ctrlp->base.uc_v4l.name, ctrlp->reg, c->value);
+			ctrlp->base.base.name, ctrlp->reg, c->value);
 		res = r5u870_set_reg_wdm(vhp, ctrlp->reg, c->value);
 		if (res)
 			return res;
@@ -858,7 +890,7 @@ enum {
 	R5U870_WDM_CTRL_LAST = 0xffff,
 };
 
-/* TODO: Merge these into V4L API. */
+/* TODO: Merge these into the standard V4L2 control API. */
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,26)
 #define V4L2_CID_GREEN_BALANCE		(V4L2_CID_BASE+24)
@@ -882,11 +914,11 @@ enum {
  * so user applications aren't confused by differing results for UVC queries */
 static const char *r5u870_powerline_names[] = { "Disabled", "50 Hz", "60 Hz" };
 
-/* TODO: Use our own internal control IDs, instead of crap unmerged ones. */
+/* TODO: Use our own internal control IDs instead of the unmerged V4L2 CIDs. */
 static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 
 	[R5U870_WDM_CTRL_BRIGHTNESS] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_BRIGHTNESS,
+		.base = { .base = { .id = V4L2_CID_BRIGHTNESS,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Brightness",
 					  .minimum = 0,
@@ -899,7 +931,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_BRIGHTNESS,
 	},
 	[R5U870_WDM_CTRL_CONTRAST] = { 
-		.base = { .uc_v4l = { .id = V4L2_CID_CONTRAST,
+		.base = { .base = { .id = V4L2_CID_CONTRAST,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Contrast",
 					  .minimum = 0,
@@ -912,7 +944,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_CONTRAST,
 	},
 	[R5U870_WDM_CTRL_SATURATION] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_SATURATION,
+		.base = { .base = { .id = V4L2_CID_SATURATION,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Saturation",
 					  .minimum = 0,
@@ -925,7 +957,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_SATURATION,
 	},
 	[R5U870_WDM_CTRL_SHARPNESS] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_SHARPNESS,
+		.base = { .base = { .id = V4L2_CID_SHARPNESS,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Sharpness",
 					  .minimum = 0,
@@ -938,7 +970,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_SHARPNESS,
 	},
 	[R5U870_WDM_CTRL_HUE] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_HUE,
+		.base = { .base = { .id = V4L2_CID_HUE,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Hue",
 					  .minimum = -180,
@@ -951,7 +983,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_HUE,
 	},
 	[R5U870_WDM_CTRL_GAMMA] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_GAMMA,
+		.base = { .base = { .id = V4L2_CID_GAMMA,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Gamma",
 					  .minimum = 0,
@@ -964,7 +996,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_GAMMA,
 	},
 	[R5U870_WDM_CTRL_BACKLIGHT_COMP_500] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_BACKLIGHT_COMPENSATION,
+		.base = { .base = { .id = V4L2_CID_BACKLIGHT_COMPENSATION,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Backlight Compensation",
 					  .minimum = 0,
@@ -977,7 +1009,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_BACKLIGHT_COMP,
 	},
 	[R5U870_WDM_CTRL_BACKLIGHT_COMP_500_DEF1] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_BACKLIGHT_COMPENSATION,
+		.base = { .base = { .id = V4L2_CID_BACKLIGHT_COMPENSATION,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Backlight Compensation",
 					  .minimum = 0,
@@ -990,7 +1022,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_BACKLIGHT_COMP,
 	},
 	[R5U870_WDM_CTRL_BACKLIGHT_COMP_X1834] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_BACKLIGHT_COMPENSATION,
+		.base = { .base = { .id = V4L2_CID_BACKLIGHT_COMPENSATION,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Backlight Compensation",
 					  .minimum = 0,
@@ -1003,7 +1035,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_BACKLIGHT_COMP_2,
 	},
 	[R5U870_WDM_CTRL_WB_RED] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_RED_BALANCE,
+		.base = { .base = { .id = V4L2_CID_RED_BALANCE,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "White Balance Red",
 					  .minimum = 0,
@@ -1018,7 +1050,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.auto_offset = offsetof(struct r5u870_ctx, vh_auto_wb)
 	},
 	[R5U870_WDM_CTRL_WB_GREEN] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_GREEN_BALANCE,
+		.base = { .base = { .id = V4L2_CID_GREEN_BALANCE,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "White Balance Green",
 					  .minimum = 0,
@@ -1033,7 +1065,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.auto_offset = offsetof(struct r5u870_ctx, vh_auto_wb)
 	},
 	[R5U870_WDM_CTRL_WB_BLUE] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_BLUE_BALANCE,
+		.base = { .base = { .id = V4L2_CID_BLUE_BALANCE,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "White Balance Blue",
 					  .minimum = 0,
@@ -1048,7 +1080,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.auto_offset = offsetof(struct r5u870_ctx, vh_auto_wb)
 	},
 	[R5U870_WDM_CTRL_WB_AUTO] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_AUTO_WHITE_BALANCE,
+		.base = { .base = { .id = V4L2_CID_AUTO_WHITE_BALANCE,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "Auto White Balance",
 					  .minimum = 0,
@@ -1063,7 +1095,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.val_offset = offsetof(struct r5u870_ctx, vh_auto_wb)
 	},
 	[R5U870_WDM_CTRL_AUTO_EXPOSURE] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_EXPOSURE_AUTO,
+		.base = { .base = { .id = V4L2_CID_EXPOSURE_AUTO,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "Auto Exposure Control",
 					  .minimum = 0,
@@ -1078,7 +1110,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.val_offset = offsetof(struct r5u870_ctx, vh_aec)
 	},
 	[R5U870_WDM_CTRL_EXPOSURE] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_EXPOSURE,
+		.base = { .base = { .id = V4L2_CID_EXPOSURE,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Exposure",
 					  .minimum = 0,
@@ -1093,7 +1125,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.auto_offset = offsetof(struct r5u870_ctx, vh_aec)
 	},
 	[R5U870_WDM_CTRL_AUTO_GAIN] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_AUTOGAIN,
+		.base = { .base = { .id = V4L2_CID_AUTOGAIN,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "Auto Gain Control",
 					  .minimum = 0,
@@ -1108,7 +1140,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.val_offset = offsetof(struct r5u870_ctx, vh_agc)
 	},
 	[R5U870_WDM_CTRL_GAIN] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_GAIN,
+		.base = { .base = { .id = V4L2_CID_GAIN,
 					  .type = V4L2_CTRL_TYPE_INTEGER,
 					  .name = "Gain",
 					  .minimum = 0,
@@ -1123,7 +1155,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.auto_offset = offsetof(struct r5u870_ctx, vh_agc)
 	},
 	[R5U870_WDM_CTRL_POWERLINE] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_POWER_LINE_FREQUENCY,
+		.base = { .base = { .id = V4L2_CID_POWER_LINE_FREQUENCY,
 					  .type = V4L2_CTRL_TYPE_MENU,
 					  .name = "Power Line Frequency",
 					  .minimum = 0,
@@ -1131,13 +1163,13 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 					  .step = 1,
 					  .default_value = 0,
 					  .flags = 0 },
-			  .uc_menu_names = r5u870_powerline_names,
+			  .menu_names = r5u870_powerline_names,
 			  .get_fn = r5u870_get_ctrl,
 			  .set_fn = r5u870_set_ctrl_wdm },
 		.reg = R5U870_REG_POWERLINE_EX,
 	},
 	[R5U870_WDM_CTRL_VFLIP] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_VFLIP,
+		.base = { .base = { .id = V4L2_CID_VFLIP,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "V-Flip",
 					  .minimum = 0,
@@ -1150,7 +1182,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_VFLIP_EX,
 	},
 	[R5U870_WDM_CTRL_VFLIP_DEFAULTON] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_VFLIP,
+		.base = { .base = { .id = V4L2_CID_VFLIP,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "V-Flip",
 					  .minimum = 0,
@@ -1163,7 +1195,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_VFLIP_EX,
 	},
 	[R5U870_WDM_CTRL_HFLIP] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_HFLIP,
+		.base = { .base = { .id = V4L2_CID_HFLIP,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "H-Flip",
 					  .minimum = 0,
@@ -1176,7 +1208,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_HFLIP_EX,
 	},
 	[R5U870_WDM_CTRL_PRIVACY] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_PRIVACY,
+		.base = { .base = { .id = V4L2_CID_PRIVACY,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "Privacy",
 					  .minimum = 0,
@@ -1189,7 +1221,7 @@ static struct r5u870_ctrl r5u870_wdm_ctrls[] = {
 		.reg = R5U870_REG_PRIVACY_EX,
 	},
 	[R5U870_WDM_CTRL_NIGHTMODE] = {
-		.base = { .uc_v4l = { .id = V4L2_CID_NIGHT_MODE,
+		.base = { .base = { .id = V4L2_CID_NIGHT_MODE,
 					  .type = V4L2_CTRL_TYPE_BOOLEAN,
 					  .name = "Night Mode",
 					  .minimum = 0,
@@ -1279,7 +1311,7 @@ static int r5u870_uvc_req(struct r5u870_ctx *vhp, int cmd,
 	out = (cmd == UVC_SET_CUR) ? 1 : 0;
 
 retry:
-	/* TODO: Base our other retry control message off this one. */
+	/* TODO: Base other retry control messages off this pattern. */
 	res = r5u870_control_msg(vhp, out, 1, cmd,
 				 (valhi << 8) | vallow, (idxhi << 8) | idxlow,
 				 buf, len);
@@ -1410,7 +1442,7 @@ static int r5u870_decide_pkt_uvc(struct r5u870_ctx *vhp, int pktstatus,
 		return -EIO;
 	}
 	vhp->vh_frame_accum += pktlen - pktdata[0];
-	if (vhp->vh_frame_accum > vhp->vh_parent->ud_format.sizeimage) {
+	if (vhp->vh_frame_accum > vhp->vh_parent->curfmt->sizeimage) {
 		r5u_err(vhp, "frame abort: accum=%d", vhp->vh_frame_accum);
 		vhp->vh_frame_accum = -1;
 		return -EPIPE;
@@ -1419,9 +1451,9 @@ static int r5u870_decide_pkt_uvc(struct r5u870_ctx *vhp, int pktstatus,
 	*start = pktdata[0];
 	if (pktdata[1] & 2) {
 		if (vhp->vh_frame_accum <
-			vhp->vh_parent->ud_format.sizeimage) {
+			vhp->vh_parent->curfmt->sizeimage) {
 			r5u_err(vhp, "warning: short frame (exp:%d got:%d)",
-				vhp->vh_parent->ud_format.sizeimage,
+				vhp->vh_parent->curfmt->sizeimage,
 				vhp->vh_frame_accum);
 		}
 		vhp->vh_frame_accum = 0;
@@ -1528,10 +1560,8 @@ static int r5u870_uvc_add_fmt(struct r5u870_ctx *vhp, const u8 *guid,
 
 	fmtp = &nfp[vhp->vh_npixfmts];
 	memset(fmtp, 0, sizeof(*fmtp));
-	strlcpy(fmtp->base.description,
-		fip->fi_name,
-		sizeof(fmtp->base.description));
-	fmtp->base.pixelformat = fip->fi_v4l_id;
+	fmtp->base.name = fip->fi_name;
+	fmtp->base.fourcc = fip->fi_v4l_id;
 	fmtp->rp_formatidx = fmtidx;
 	fmtp->rp_restbl = (struct r5u870_resolution *)
 		kmalloc((1 + nresolutions) * sizeof(*fmtp->rp_restbl),
@@ -1555,10 +1585,10 @@ static int r5u870_uvc_add_fmt(struct r5u870_ctx *vhp, const u8 *guid,
 
 	r5u_dbg(vhp, R5U_INIT, "Found format %d: %c%c%c%c (%d frames)",
 		fmtidx,
-		fmtp->base.pixelformat & 0xff,
-		(fmtp->base.pixelformat >> 8) & 0xff,
-		(fmtp->base.pixelformat >> 16) & 0xff,
-		(fmtp->base.pixelformat >> 24) & 0xff,
+		fmtp->base.fourcc & 0xff,
+		(fmtp->base.fourcc >> 8) & 0xff,
+		(fmtp->base.fourcc >> 16) & 0xff,
+		(fmtp->base.fourcc >> 24) & 0xff,
 		nresolutions);
 
 	return 0;
@@ -1819,12 +1849,12 @@ static int r5u870_set_ctrl_uvc(struct usbcam_dev *udp,
 
 	if (!(ctrlp->info & 2)) {
 		r5u_dbg(vhp, R5U_CTRL, "control %s <= %d [set not supported]",
-			ctrlp->base.uc_v4l.name, c->value);
+			ctrlp->base.base.name, c->value);
 		return -EINVAL;
 	}
 
 	r5u_dbg(vhp, R5U_CTRL, "control %s/uvc %02x <= %d",
-		ctrlp->base.uc_v4l.name, ctrlp->reg, c->value);
+		ctrlp->base.base.name, ctrlp->reg, c->value);
 
 	val = c->value;
 	res = r5u870_uvc_ctrl_req(vhp, ctrlp, UVC_SET_CUR, &val);
@@ -1863,14 +1893,12 @@ static int r5u870_uvc_init_ctrl(struct r5u870_ctx *vhp,
 	if (!ctrlp)
 		return -ENOMEM;
 
-	ctrlp->base.uc_v4l.id = cip->ci_v4l_id;
-	ctrlp->base.uc_v4l.type = cip->ci_v4l_type;
-	strlcpy(ctrlp->base.uc_v4l.name,
-		cip->ci_name,
-		sizeof(ctrlp->base.uc_v4l.name));
-	ctrlp->base.uc_v4l.flags = cip->ci_v4l_flags;
-	ctrlp->base.uc_v4l.step = 1;
-	ctrlp->base.uc_menu_names = cip->ci_menu_names;
+	ctrlp->base.base.id = cip->ci_v4l_id;
+	ctrlp->base.base.type = cip->ci_v4l_type;
+	ctrlp->base.base.name = cip->ci_name;
+	ctrlp->base.base.flags = cip->ci_v4l_flags;
+	ctrlp->base.base.step = 1;
+	ctrlp->base.menu_names = cip->ci_menu_names;
 	ctrlp->base.get_fn = r5u870_get_ctrl;
 	ctrlp->base.set_fn = r5u870_set_ctrl_uvc;
 	ctrlp->base.query_fn = r5u870_query_ctrl;
@@ -1886,30 +1914,29 @@ static int r5u870_uvc_init_ctrl(struct r5u870_ctx *vhp,
 	ctrlp->info = val;
 
 	if (cip->ci_min_force) {
-		ctrlp->base.uc_v4l.minimum = cip->ci_min;
+		ctrlp->base.base.minimum = cip->ci_min;
 	} else {
 		res = r5u870_uvc_ctrl_req(vhp, ctrlp, UVC_GET_MIN, &val);
 		if (res < 0)
 			goto failed;
-		ctrlp->base.uc_v4l.minimum = val;
+		ctrlp->base.base.minimum = val;
 	}
 	if (cip->ci_max_force) {
-		ctrlp->base.uc_v4l.maximum = cip->ci_max;
+		ctrlp->base.base.maximum = cip->ci_max;
 	} else {
 		res = r5u870_uvc_ctrl_req(vhp, ctrlp, UVC_GET_MAX, &val);
 		if (res < 0)
 			goto failed;
-		ctrlp->base.uc_v4l.maximum = val;
+		ctrlp->base.base.maximum = val;
 	}
 
 	if (cip->ci_def_force) {
-		ctrlp->base.uc_v4l.default_value = cip->ci_def;
+		ctrlp->base.base.default_value = cip->ci_def;
 	} else {
 		res = r5u870_uvc_ctrl_req(vhp, ctrlp, UVC_GET_DEF, &val);
 		if (res)
 			goto failed;
-			return res;
-		ctrlp->base.uc_v4l.default_value = val;
+		ctrlp->base.base.default_value = val;
 	}
 
 	res = usbcam_ctrl_add(vhp->vh_parent, &ctrlp->base);
@@ -1917,8 +1944,8 @@ static int r5u870_uvc_init_ctrl(struct r5u870_ctx *vhp,
 		goto failed;
 
 	r5u_dbg(vhp, R5U_INIT, "Found UVC control %s [%d,%d] def:%d info:%02x",
-		ctrlp->base.uc_v4l.name, ctrlp->base.uc_v4l.minimum,
-		ctrlp->base.uc_v4l.maximum, ctrlp->base.uc_v4l.default_value,
+		ctrlp->base.base.name, (int)ctrlp->base.base.minimum,
+		(int)ctrlp->base.base.maximum, (int)ctrlp->base.base.default_value,
 		ctrlp->info);
 	return 0;
 
@@ -1951,7 +1978,7 @@ static int r5u870_uvc_add_ctrls(struct r5u870_ctx *vhp, int unit,
 static int r5u870_uvc_parse_vc(struct r5u870_ctx *vhp)
 {
 	struct usb_host_interface *aintf =
-		vhp->vh_parent->ud_intf->cur_altsetting;
+		vhp->vh_parent->intf->cur_altsetting;
 	u8 *desc;
 	int dlen, rlen, count;
 	int i, res;
@@ -1980,11 +2007,13 @@ static int r5u870_uvc_parse_vc(struct r5u870_ctx *vhp)
 			}
 
 			for (i = 0; i < count; i++) {
-				res = usbcam_claim_interface(vhp->vh_parent,
-								 desc[12 + i]);
-				if (res)
-					r5u_err(vhp, "interface %d already "
-						"claimed", desc[12 + i]);
+			res = usbcam_claim_interface(vhp->vh_parent,
+							 desc[12 + i]);
+				if (res) {
+					r5u_err(vhp, "failed to claim interface %d: %d",
+						desc[12 + i], res);
+					return res;
+				}
 				vhp->vh_iso_ifnum = desc[12 + i];
 
 				res = r5u870_uvc_parse_vs(vhp, desc[12 + i]);
@@ -2016,14 +2045,14 @@ static int r5u870_uvc_parse_vc(struct r5u870_ctx *vhp)
 
 static void r5u870_do_stop(struct r5u870_ctx *vhp)
 {
-	if (vhp->vh_parent->ud_capturing) {
-		vhp->vh_parent->ud_capturing = 0;
+	if (vhp->vh_parent->streaming) {
+		vhp->vh_parent->streaming = 0;
 		vhp->vh_ctrl_reg_enable = 0;
 
-		usbcam_urbstream_stop(&vhp->vh_iso, 0);
+		usbcam_urbstream_stop(&vhp->vh_iso);
 		usbcam_curframe_abortall(vhp->vh_parent);
 
-		if (!vhp->vh_parent->ud_disconnected) {
+		if (!vhp->vh_parent->disconnected) {
 			usb_set_interface(r5u870_dev(vhp),
 					  vhp->vh_iso_ifnum,
 					  0);
@@ -2045,7 +2074,6 @@ static void r5u870_iso_packet_done(struct usbcam_dev *udp,
 				   int pktlen, int pktstatus)
 {
 	struct r5u870_ctx *vhp = udp_r5u870(udp);
-	struct usbcam_curframe cf;
 	int res, start = 0;
 
 	res = vhp->vh_decide_pkt(vhp, pktstatus, pktlen,
@@ -2062,7 +2090,7 @@ static void r5u870_iso_packet_done(struct usbcam_dev *udp,
 	case 0:
 	case -EAGAIN:
 		if (pktlen) {
-			if (usbcam_curframe_get(udp, &cf)) {
+			if (!udp->curframe_buf) {
 				/*
 				 * We have data, but there is no frame buffer
 				 * queued to accept it, so we stop.
@@ -2072,7 +2100,7 @@ static void r5u870_iso_packet_done(struct usbcam_dev *udp,
 			}
 
 			BUG_ON(pktlen - start + vhp->vh_framebuf_offset >
-				   cf.uf_size);
+				   udp->curframe_size);
 
 			/*
 			 * This is our one and only memcpy.
@@ -2080,7 +2108,7 @@ static void r5u870_iso_packet_done(struct usbcam_dev *udp,
 			 * we cannot predict into which isochronous
 			 * packets the camera will choose to return data.
 			 */
-			memcpy(cf.uf_base + vhp->vh_framebuf_offset,
+			memcpy(udp->curframe_buf + vhp->vh_framebuf_offset,
 				   pktdata + start,
 				   pktlen - start);
 			vhp->vh_framebuf_offset += (pktlen - start);
@@ -2109,7 +2137,7 @@ static void r5u870_iso_submit_error(struct usbcam_dev *udp,
 	r5u870_do_stop(vhp);
 }
 
-static struct usbcam_urbstream_ops r5u870_urb_data_ops = {
+static struct usbcam_urbstream_ops __attribute__((unused)) r5u870_urb_data_ops = {
 	.packet_done	= r5u870_iso_packet_done,
 	.submit_error	= r5u870_iso_submit_error,
 };
@@ -2170,10 +2198,10 @@ static int r5u870_usbcam_init(struct usbcam_dev *udp,
 	}
 
 	r5u_info(vhp, "Detected %s", vhp->vh_model->rm_name);
-	snprintf(vhp->vh_parent->ud_vdev.name,
-		 sizeof(vhp->vh_parent->ud_vdev.name),
+	snprintf(vhp->vh_parent->vdev.name,
+		 sizeof(vhp->vh_parent->vdev.name),
 		 "%s #%d",
-		 vhp->vh_model->rm_name, vhp->vh_parent->ud_minidrv_id + 1);
+		 vhp->vh_model->rm_name, vhp->vh_parent->minidrv_id + 1);
 
 	res = r5u870_dev_init(vhp);
 	if (res < 0) {
@@ -2196,7 +2224,7 @@ static int r5u870_usbcam_init(struct usbcam_dev *udp,
 	} else {
 		/* We are looking at a proprietary Ricoh interface */
 		vhp->vh_iso_ifnum =
-			udp->ud_intf->altsetting->desc.bInterfaceNumber;
+			udp->intf->altsetting->desc.bInterfaceNumber;
 		vhp->vh_iso_ep = 6;
 	}
 
@@ -2215,26 +2243,25 @@ static int r5u870_usbcam_init(struct usbcam_dev *udp,
 		goto out_failed;
 	}
 
-	udp->ud_fmt_array = &vhp->vh_pixfmts[0].base;
-	udp->ud_fmt_array_elem_size = sizeof(vhp->vh_pixfmts[0]);
-	udp->ud_fmt_array_len = vhp->vh_npixfmts;
+	udp->fmts = &vhp->vh_pixfmts[0].base;
+	udp->fmts_elem_size = sizeof(vhp->vh_pixfmts[0]);
+	udp->fmts_len = vhp->vh_npixfmts;
 
 	if (!vhp->vh_model->rm_no_first_auto_suppress)
 		vhp->vh_ctrl_auto_suppress = 1;
 
-	usbcam_urbstream_init(&vhp->vh_iso, udp, vhp->vh_iso_ep);
+	usbcam_urbstream_init(&vhp->vh_iso, udp, 4,
+				 vhp->vh_iso_minpacket, 1, 1,
+				 vhp->vh_iso_ep, USB_DIR_IN | USB_ENDPOINT_XFER_ISOC);
 
 	/* Set the default format */
 	vhp->vh_fmt = &vhp->vh_pixfmts[0];
 	vhp->vh_res = &vhp->vh_fmt->rp_restbl[0];
-	udp->ud_format.width = vhp->vh_res->rw_width;
-	udp->ud_format.height = vhp->vh_res->rw_height;
-	udp->ud_format.pixelformat = vhp->vh_fmt->base.pixelformat;
-	udp->ud_format.field = V4L2_FIELD_INTERLACED;
-	udp->ud_format.bytesperline = udp->ud_format.width * 2;
-	udp->ud_format.sizeimage = (udp->ud_format.width *
-					udp->ud_format.height * 2);
-	udp->ud_format.colorspace = V4L2_COLORSPACE_SMPTE170M;
+	udp->curfmt = (struct usbcam_pix_fmt *)&vhp->vh_fmt->base;
+	udp->curfmt->bytesperline = vhp->vh_res->rw_width * 2;
+	udp->curfmt->sizeimage = (vhp->vh_res->rw_width *
+					 vhp->vh_res->rw_height * 2);
+	udp->frame_size = udp->curfmt->sizeimage;
 
 	/* Configure default values for all controls */
 	res = r5u870_set_controls(vhp, 1);
@@ -2262,14 +2289,14 @@ static void r5u870_usbcam_disconnect(struct usbcam_dev *udp)
  * yet set the supports_autosuspend field in the ops structure.
  */
 
-static int r5u870_usbcam_suspend(struct usbcam_dev *udp, pm_message_t msg)
+static int __attribute__((unused)) r5u870_usbcam_suspend(struct usbcam_dev *udp, pm_message_t msg)
 {
 	struct r5u870_ctx *vhp = udp_r5u870(udp);
 	r5u870_do_stop(vhp);
 	return 0;
 }
 
-static int r5u870_usbcam_resume(struct usbcam_dev *udp)
+static int __attribute__((unused)) r5u870_usbcam_resume(struct usbcam_dev *udp)
 {
 	struct r5u870_ctx *vhp = udp_r5u870(udp);
 	int res;
@@ -2296,7 +2323,7 @@ static int r5u870_try_format(struct usbcam_dev *udp, struct v4l2_pix_format *f,
 
 	fmt = NULL;
 	for (i = 0; i < vhp->vh_npixfmts; i++) {
-		if (vhp->vh_pixfmts[i].base.pixelformat == f->pixelformat) {
+		if (vhp->vh_pixfmts[i].base.fourcc == f->pixelformat) {
 			fmt = &vhp->vh_pixfmts[i];
 			break;
 		}
@@ -2347,13 +2374,13 @@ static int r5u870_try_format(struct usbcam_dev *udp, struct v4l2_pix_format *f,
 	memset(f, 0, sizeof(*f));
 	f->width = res->rw_width;
 	f->height = res->rw_height;
-	f->pixelformat = fmt->base.pixelformat;
+	f->pixelformat = fmt->base.fourcc;
 	f->bytesperline = f->width * 2;
 	f->sizeimage = f->width * f->height * 2;
 	f->field = V4L2_FIELD_INTERLACED;
 	f->colorspace = V4L2_COLORSPACE_SMPTE170M;
 
-	r5u_dbg(vhp, R5U_INIT, "Settled on pixel format: %d (%s)", fmt->base.pixelformat, fmt->base.description);
+	r5u_dbg(vhp, R5U_INIT, "Settled on pixel format: %d (%s)", fmt->base.fourcc, fmt->base.name);
 
 	if (fmt_out)
 		(*fmt_out) = fmt;
@@ -2363,14 +2390,14 @@ static int r5u870_try_format(struct usbcam_dev *udp, struct v4l2_pix_format *f,
 	return 0;
 }
 
-static int r5u870_usbcam_try_format(struct usbcam_dev *udp,
-					struct v4l2_pix_format *f)
+static int __attribute__((unused)) r5u870_usbcam_try_format(struct usbcam_dev *udp,
+				struct v4l2_pix_format *f)
 {
 	return r5u870_try_format(udp, f, NULL, NULL);
 }
 
-static int r5u870_usbcam_set_format(struct usbcam_dev *udp,
-					struct v4l2_pix_format *f)
+static int __attribute__((unused)) r5u870_usbcam_set_format(struct usbcam_dev *udp,
+				struct v4l2_pix_format *f)
 {
 	struct r5u870_ctx *vhp = udp_r5u870(udp);
 	const struct r5u870_pix_fmt *fmt_out;
@@ -2381,13 +2408,14 @@ static int r5u870_usbcam_set_format(struct usbcam_dev *udp,
 	if (res)
 		return res;
 
-	if ((udp->ud_format.width != f->width) ||
-		(udp->ud_format.height != f->height) ||
-		(udp->ud_format.pixelformat != f->pixelformat) ||
-		(udp->ud_format.sizeimage != f->sizeimage))
+	if ((udp->curfmt &&
+	     (udp->curfmt->fourcc != f->pixelformat ||
+	      udp->curfmt->sizeimage != f->sizeimage)))
 		vhp->vh_configured = 0;
 
-	udp->ud_format = *f;
+	udp->curfmt = (struct usbcam_pix_fmt *)&fmt_out->base;
+	udp->curfmt->bytesperline = f->bytesperline;
+	udp->curfmt->sizeimage = f->sizeimage;
 	vhp->vh_fmt = fmt_out;
 	vhp->vh_res = res_out;
 	return 0;
@@ -2438,7 +2466,7 @@ static int r5u870_usbcam_cap_start(struct usbcam_dev *udp)
 	struct r5u870_ctx *vhp = udp_r5u870(udp);
 	int res;
 
-	if (vhp->vh_parent->ud_capturing)
+	if (vhp->vh_parent->streaming)
 		return 0;
 
 	if (!vhp->vh_model->rm_uvc) {
@@ -2474,14 +2502,13 @@ static int r5u870_usbcam_cap_start(struct usbcam_dev *udp)
 	vhp->vh_configured = 1;
 
 	res = usbcam_urbstream_config_iso(&vhp->vh_iso,
-					  &r5u870_urb_data_ops,
-					  0, 0, 1, 0);
+					  vhp->vh_iso_minpacket, 1, 1);
 	if (res < 0) {
 		r5u_err(vhp, "urbstream init failed: %d", res);
 		goto out_set_idle;
 	}
 
-	udp->ud_capturing = 1;
+	udp->streaming = 1;
 
 	if (!vhp->vh_model->rm_uvc) {
 		res = r5u870_set_cap_state_wdm(vhp, 1);
@@ -2526,22 +2553,21 @@ out_set_idle:
 	(void) usb_set_interface(r5u870_dev(vhp), vhp->vh_iso_ifnum, 0);
 out_failed:
 	vhp->vh_ctrl_reg_enable = 0;
-	vhp->vh_parent->ud_capturing = 0;
+	vhp->vh_parent->streaming = 0;
 	return res;
 }
 
+/* Wrapper: adapt init signature (new API drops devid param, use udp->devid) */
+static int r5u870_usbcam_init_wrapper(struct usbcam_dev *udp)
+{
+	return r5u870_usbcam_init(udp, udp->devid);
+}
+
 static struct usbcam_dev_ops r5u870_usbcam_dev_ops = {
-	.init		= r5u870_usbcam_init,
-	.disconnect	= r5u870_usbcam_disconnect,
-	.release	= r5u870_usbcam_release,
-	.suspend	= r5u870_usbcam_suspend,
-	.resume		= r5u870_usbcam_resume,	
-	.try_format	= r5u870_usbcam_try_format,
-	.set_format	= r5u870_usbcam_set_format,
+	.init		= r5u870_usbcam_init_wrapper,
+	.exit		= r5u870_usbcam_disconnect,
 	.cap_start	= r5u870_usbcam_cap_start,
 	.cap_stop	= r5u870_usbcam_cap_stop,
-
-	/* .supports_autosuspend = 1, */
 };
 
 
@@ -2650,7 +2676,7 @@ static const int r5u870_1870_ctrls[] = {
  * descriptor tables, and get sets of hard-coded vendor controls
  */
 
-// FIXME: This device still has a bunch of unknown control IDs.
+/* Note: This device still has a number of unknown control IDs. */
 static const int r5u870_1812_ctrls[] = {
 	R5U870_WDM_CTRL_WB_RED,
 	R5U870_WDM_CTRL_WB_GREEN,
@@ -2710,8 +2736,7 @@ static const int r5u870_1810_183a_ctrls[] = {
 	R5U870_WDM_CTRL_LAST,
 };
 static const int r5u870_1810_183b_ctrls[] = {
-	/* TODO: Maybe there are more of these? I don't actually have a webcam
-	   to test against the different WDM controls. */
+	/* Note: Additional WDM controls may exist but are unverified. */
  	R5U870_WDM_CTRL_WB_RED, 
  	R5U870_WDM_CTRL_WB_GREEN,
  	R5U870_WDM_CTRL_WB_BLUE, 
@@ -2723,8 +2748,7 @@ static const int r5u870_1810_183b_ctrls[] = {
 	R5U870_WDM_CTRL_LAST,
 };
 static const int r5u870_1810_183e_ctrls[] = {
-	/* TODO: Maybe there are more of these? I don't actually have a webcam
-	   to test against the different WDM controls. */
+	/* Note: Additional WDM controls may exist but are unverified. */
  	R5U870_WDM_CTRL_WB_RED,
  	R5U870_WDM_CTRL_WB_GREEN,
  	R5U870_WDM_CTRL_WB_BLUE,
@@ -2736,8 +2760,7 @@ static const int r5u870_1810_183e_ctrls[] = {
 	R5U870_WDM_CTRL_LAST,
 };
 static const int r5u870_1810_1839_ctrls[] = {
-	/* TODO: Maybe there are more of these? I don't actually have a webcam
-   	   to test against the different WDM controls. */
+	/* Note: Additional WDM controls may exist but are unverified. */
 	R5U870_WDM_CTRL_WB_RED,
 	R5U870_WDM_CTRL_WB_GREEN,
 	R5U870_WDM_CTRL_WB_BLUE,
@@ -2749,8 +2772,7 @@ static const int r5u870_1810_1839_ctrls[] = {
 };
 
 static const int r5u870_1841_ctrls[] = {
-	/* TODO: Maybe there are more of these? I don't actually have a webcam
-	   to test against the different WDM controls. */
+	/* Note: Additional WDM controls may exist but are unverified. */
 	R5U870_WDM_CTRL_WB_RED,
 	R5U870_WDM_CTRL_WB_GREEN,
 	R5U870_WDM_CTRL_WB_BLUE,
@@ -2788,28 +2810,28 @@ static const struct r5u870_resolution r5u870_sxga_wdm_res[] = {
 	{ }
 };
 static struct r5u870_pix_fmt r5u870_vga_wdm_pixfmts[] = {
-	{ .base = { .description = "YUY2 4:2:2",
-			.pixelformat = V4L2_PIX_FMT_YUYV,
-			.flags = 0 },
+	{ .base = { .name = "YUY2 4:2:2",
+			.fourcc = V4L2_PIX_FMT_YUYV,
+			.bpp = 16 },
 	  .rp_formatidx = 0,
 	  .rp_restbl = r5u870_vga_wdm_res },
 
-	{ .base = { .description = "UYVY 4:2:2",
-			.pixelformat = V4L2_PIX_FMT_UYVY,
-			.flags = 0 },
+	{ .base = { .name = "UYVY 4:2:2",
+			.fourcc = V4L2_PIX_FMT_UYVY,
+			.bpp = 16 },
 	  .rp_formatidx = 1,
 	  .rp_restbl = r5u870_vga_wdm_res },
 };
 static struct r5u870_pix_fmt r5u870_sxga_wdm_pixfmts[] = {
-	{ .base = { .description = "YUY2 4:2:2",
-			.pixelformat = V4L2_PIX_FMT_YUYV,
-			.flags = 0 },
+	{ .base = { .name = "YUY2 4:2:2",
+			.fourcc = V4L2_PIX_FMT_YUYV,
+			.bpp = 16 },
 	  .rp_formatidx = 0,
 	  .rp_restbl = r5u870_sxga_wdm_res },
 
-	{ .base = { .description = "UYVY 4:2:2",
-			.pixelformat = V4L2_PIX_FMT_UYVY,
-			.flags = 0 },
+	{ .base = { .name = "UYVY 4:2:2",
+			.fourcc = V4L2_PIX_FMT_UYVY,
+			.bpp = 16 },
 	  .rp_formatidx = 1,
 	  .rp_restbl = r5u870_sxga_wdm_res },
 };
@@ -2892,7 +2914,7 @@ static const struct r5u870_model r5u870_models[] = {
 	},
 	[R5U870_DI_VGP_VCC6] = {
 		.rm_name = "Sony VGP-VCC6",
-		.rm_ucode_file = "r5u870_1839.fw",
+		.rm_ucode_file = "r5u870_1836.fw",
 		.rm_ucode_version = 0x0113,
 		.rm_wdm_ctrlids = r5u870_1810_1839_ctrls,
 		.rm_uvc = 1,
@@ -3043,7 +3065,7 @@ static const struct usb_device_id id_table[] = {
 DEFINE_USBCAM_MINIDRV_MODULE(R5U870_VERSION, R5U870_VERSION_EXTRA,
 				 &r5u870_usbcam_dev_ops,
 				 sizeof(struct r5u870_ctx),
-				 id_table)
+				 id_table);
 
 MODULE_DEVICE_TABLE(usb, id_table);
 MODULE_DESCRIPTION("Driver for Ricoh R5U870-based Webcams");

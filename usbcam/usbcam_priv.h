@@ -1,12 +1,14 @@
 /*
  * USBCAM abstraction library for USB webcam drivers
+ * Private/internal header - V4L2 + videobuf2 compatible
  *
- * Copyright (c) 2007 Sam Revitch <samr7 cs washington edu>
+ * Copyright (c) 2007 Sam Revitch <samr7@cs.washington.edu>
+ * Copyright (c) 2008 Alexander Hixon <hixon.alexander@mediati.org>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -15,197 +17,257 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-/*
- * This header file is private and internal to usbcam.
- * DO NOT INCLUDE THIS HEADER FILE IN MINIDRIVERS.  USE usbcam.h INSTEAD.
- */
-
-#if !defined(__USBCAM_PRIV_H__)
+#ifndef __USBCAM_PRIV_H__
 #define __USBCAM_PRIV_H__
 
+/*
+ * Kernel headers
+ */
+#include <linux/videodev2.h>
+#include <media/videobuf2-core.h>
+#include <media/videobuf2-v4l2.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-dev.h>
+#include <linux/usb.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+#include <linux/slab.h>
+#include <linux/workqueue.h>
+#include <linux/poll.h>
+#include <linux/mm.h>
+#include <linux/dma-mapping.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
+#include <linux/completion.h>
+#include <linux/errno.h>
+#include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/device.h>
+
+/*
+ * Public types (pixel formats, controls, urbstream, dev_ops, etc.)
+ */
 #include "usbcam.h"
 
-#include <linux/kernel.h>
-#include <linux/kthread.h>
-#include <linux/signal.h>
-#include <linux/sched.h>
-#include <linux/list.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0) /*3pei*/
-#include <linux/smp_lock.h>
-#endif
-#include <linux/vmalloc.h>
-#include <linux/mm.h>
-#include <linux/timer.h>
-#include <linux/init.h>
-#include <linux/spinlock.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,38)
-#include <linux/videodev.h>
-#else
-#include "libv4l1-videodev.h"
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-#include <media/video-buf.h>
-#else
-#include <media/videobuf-dma-sg.h>
-#endif
-
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19)
-#define usb_endpoint_xfer_bulk(EPD) \
-	(((EPD)->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == \
-	 USB_ENDPOINT_XFER_BULK)
-#define usb_endpoint_xfer_int(EPD) \
-	(((EPD)->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == \
-	 USB_ENDPOINT_XFER_INT)
-#define usb_endpoint_xfer_isoc(EPD) \
-	(((EPD)->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == \
-	 USB_ENDPOINT_XFER_ISOC)
-#define usb_endpoint_dir_in(EPD) \
-	(((EPD)->bEndpointAddress & USB_ENDPOINT_DIR_MASK) == USB_DIR_IN)
-#define usb_autopm_get_interface(X) 0
-#define usb_autopm_put_interface(X)
-#endif  /* LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19) */
-
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,25)
-#if !defined(videobuf_queue_pci_init)
-#define videobuf_queue_pci_init videobuf_queue_sg_init
-#endif
-#endif
-
 /*
- * When creating a minidriver that is not part of the core kernel, it
- * may be desired to use a specific version of usbcam.  In this case,
- * usbcam's symbols should be available only to the minidriver with
- * which it is linked, and its symbols should not be exported.
- */
-#define USBCAM_EXPORT_SYMBOL(X) EXPORT_SYMBOL(X)
-
-#define assert usbcam_assert
-
-#define usbcam_drvname(MDP) ((MDP)->um_owner->name)
-
-#if defined(CONFIG_USB_USBCAM_DEBUG)
-#define usbcam_dbgm(MD, SUBSYS, FMT, ARG...) do {			\
-	if ((MD)->um_debug &&						\
-	    *(MD)->um_debug & (1UL << USBCAM_DBG_ ## SUBSYS))		\
-		printk(KERN_DEBUG "%s: " FMT "\n",			\
-		       (MD)->um_modname, ## ARG);			\
-} while (0)
-#else
-#define usbcam_dbgm(MD, SUBSYS, FMT, ARG...)
-#endif  /* defined(CONFIG_USB_USBCAM_DEBUG) */
-
-#define usbcam_minidrv_op_present(UDP, CB) 				\
-	((UDP)->ud_minidrv->um_ops->CB ? 1 : 0)
-#define usbcam_minidrv_op(UDP, CB, ARGS...)				\
-	((UDP)->ud_minidrv->um_ops->CB((UDP), ## ARGS))
-
-
-/*
- * Private data structure definitions
- */
-
-/*
- * This structure represents a registered minidriver
- */
-struct usbcam_minidrv {
-	struct kref			um_kref;
-	struct module			*um_owner;
-	const char			*um_modname;
-	int				*um_debug;
-	int				um_version;
-	int				um_dev_count;
-	struct list_head		um_dev_list;
-	int				um_dev_privsize;
-	struct usb_driver		um_usbdrv;
-	struct mutex			um_lock;
-	const struct usbcam_dev_ops	*um_ops;
-	struct video_device		um_videodev_template;
-	struct v4l2_file_operations		um_v4l_fops;
-	const int			*um_video_nr_array;
-	int				um_video_nr_array_len;
-};
-
-/*
- * The frame structure is generally managed by the video-buf module
- * and represents some chunk of memory that the video4linux client
- * requested as a frame buffer.  It might be kmalloc()'d, or it might
- * be mapped from a user address space.  In either case, usbcam
- * guarantees a contiguous kernel mapping accessible to the minidriver.
- *
- * The primary reason to use video-buf in usbcam is for its
- * implementation of buffer mapping methods and "zero-copy" kernel-user
- * data movement.  The V4L2 API is quite rich, and it's much easier to
- * use video-buf than to create a private full-featured implementation,
- * and much more desirable to use video-buf than to limp along with a
- * substandard implementation.  The video-buf module isn't specifically
- * used for DMA functionality, as most USB devices, with the possible
- * exception of those employing bulk transfers, are unsuitable for
- * direct frame buffer DMA.
- *
- * Minidrivers can access details of the current frame using
- * usbcam_curframe_get(), and can signal completion of the current
- * frame with usbcam_curframe_complete().  It is up to the minidriver
- * to fill in the frame buffer.
+ * Internal frame descriptor (used by usbcam_buf.c for frame accumulation)
  */
 struct usbcam_frame {
-	struct videobuf_buffer	vbb;
-	struct list_head	cap_links;
-	void			*vmap_base;
-	void			*vmap_sof;
+	struct list_head		fl_links;
+	unsigned char			*fl_buf;
+	int				fl_size;
+	int				fl_filled;
+	int				fl_done;
+	struct vb2_buffer		*fl_vb;
 };
 
 /*
- * This structure represents an open file handle and the frame
- * buffers associated with that client
+ * Main device structure (internal definition with all driver fields)
+ *
+ * NOTE: This is the authoritative definition used by the library .c files.
+ * The public header (usbcam.h) forward-declares struct usbcam_dev for
+ * minidriver callback signatures.
  */
-struct usbcam_fh {
-	struct usbcam_dev		*ufh_dev;
-	int				ufh_flags;
-	struct videobuf_queue		ufh_vbq;
+struct usbcam_dev {
+	/* V4L2 video device (must be first for container_of patterns) */
+	struct video_device		vdev;
+
+	/* V4L2 device (required by kernel 7.0 video_register_device) */
+	struct v4l2_device		v4l2_dev;
+
+	/* USB interface and device */
+	struct usb_interface		*intf;
+	struct usb_device		*udev;
+	const struct usb_device_id	*devid;
+
+	/* Videobuf2 queue for frame buffers */
+	struct vb2_queue		vq;
+
+	/* URB streaming infrastructure */
+	struct usbcam_urbstream		urbstream;
+
+	/* V4L2 controls */
+	struct usbcam_ctrl		*ctrls;
+	int				ctrls_len;
+
+	/* Pixel formats */
+	const struct usbcam_pix_fmt	*fmts;
+	int				fmts_len;
+	int				fmts_elem_size;
+	struct usbcam_pix_fmt		*curfmt;
+
+	/* State flags */
+	int				streaming;
+	int				opened;
+	int				disconnected;
+
+	/* Synchronization */
+	struct mutex			lock;
+	wait_queue_head_t		wq;
+
+	/* Frame accumulation */
+	int				frame_accum;
+	int				frame_size;
+
+	/* Minidriver operations */
+	const struct usbcam_dev_ops	*ops;
+	void				*minidrv_data;
+	int				minidrv_id;
+
+	/* Video device minor number */
+	int				video_nr;
+
+	/* DMA device pointer (for dma_map/dma_unmap) */
+	struct device			*dev;
+
+	/* Debug level (bitmask of USBCAM_DBG_* bits) */
+	int				debug;
+
+	/* URB timeout in jiffies */
+	int				timeout;
+
+	/* Deferred work items */
+	struct usbcam_workitem		*workitem;
+	struct usbcam_delayedwork	*delayedwork;
+
+	/* Current frame tracking */
+	int				curframe;
+	unsigned char			*curframe_buf;
+	int				curframe_size;
+
+	/* Frame list (linked list of struct usbcam_frame) */
+	struct list_head		frame_list;
+	spinlock_t			frame_lock;
 };
 
-#define USBCAM_FH_USE_FIXED_FB		0x00000001
+/*
+ * Helper macros
+ */
 
-extern void usbcam_work_stop(struct usbcam_dev *udp);
-extern void usbcam_capture_stop(struct usbcam_dev *udp);
+/* Convert a video_device pointer back to the containing usbcam_dev */
+#define usbcam_to_dev(vdev)	container_of(vdev, struct usbcam_dev, vdev)
+
+/* Convert a vb2_queue pointer back to the containing usbcam_dev */
+#define usbcam_to_dev_vq(vq)	container_of(vq, struct usbcam_dev, vq)
+
+/* Debug logging (gated by debug bitmask) */
+#define usbcam_dbg(UDP, BIT, fmt, ...) \
+	if ((UDP)->debug & (1 << (BIT))) \
+		dev_info((UDP)->dev, fmt, ##__VA_ARGS__)
+
+/* Unconditional error/warning logging */
+#define usbcam_err(UDP, fmt, ...) \
+	dev_err((UDP)->dev, fmt, ##__VA_ARGS__)
+
+#define usbcam_warn(UDP, fmt, ...) \
+	dev_warn((UDP)->dev, fmt, ##__VA_ARGS__)
+
+#define usbcam_info(UDP, fmt, ...) \
+	dev_info((UDP)->dev, fmt, ##__VA_ARGS__)
+
+/*
+ * Internal (non-public) function declarations
+ * These are shared between usbcam_buf.c, usbcam_dev.c, usbcam_fops.c,
+ * and usbcam_util.c but are NOT part of the minidriver API.
+ */
+
+/* --- usbcam_buf.c internals --- */
+extern int usbcam_vb2_start_streaming_urb(struct vb2_queue *vq, unsigned int count);
+extern void usbcam_vb2_stop_streaming_urb(struct vb2_queue *vq);
+
+/* --- usbcam_dev.c internals --- */
 extern void usbcam_ctrl_releaseall(struct usbcam_dev *udp);
+extern int usbcam_dev_probe(struct usbcam_dev *udp,
+			     const struct usbcam_dev_ops *ops,
+			     int video_nr);
+extern void usbcam_dev_remove(struct usbcam_dev *udp);
+extern int usbcam_videodev_register(struct usbcam_dev *udp);
+extern void usbcam_videodev_unregister(struct usbcam_dev *udp);
+
+/* --- usbcam_fops.c internals (static, no extern needed) --- */
+
+/* --- usbcam_util.c internals --- */
+extern int usbcam_claim_interface(struct usbcam_dev *udp, int ifnum);
+extern int usbcam_choose_altsetting(struct usbcam_dev *udp, int ifnum,
+				    int pipe, int bytes_per_sec_min,
+				    int pkt_min, int pkt_max,
+				    int *altsetting_nr);
+extern struct urb *usbcam_urb_alloc(struct usbcam_dev *udp, int pipe,
+				    int pktsize, int npkts, int alloc_buf);
+extern void usbcam_urb_free(struct urb *urbp, int free_buf);
+extern void usbcam_hexdump(struct usbcam_dev *udp, const u8 *buf, size_t len);
 
 /*
- * The below maybe_stop function allows usbcam to ensure that any kernel
- * threads it creates are completely stopped and not executing any
- * usbcam code at module unload time.
- *
- * This is ugly but it remains unclear how better to do it.
+ * Internal template structures (defined in usbcam_fops.c / usbcam_dev.c)
  */
-static inline void usbcam_work_maybe_stop(struct usbcam_dev *udp)
-{
-	if (!udp->ud_work_refs)
-		usbcam_work_stop(udp);
-}
+extern const struct v4l2_file_operations usbcam_v4l2_fops_template;
+extern const struct video_device usbcam_videodev_template;
 
 /*
- * Only stop capturing if no frames are queued.
+ * Minidriver module registration macro
  *
- * We allow and encourage the minidriver to continue capturing in the
- * last requested format, and have it stop autonomously when it receives
- * its first data for the next frame but finds no frame available.  This
- * expedites the process for situations such as S_FMT which cannot
- * tolerate capture being in progress.
+ * Expands to a complete USB driver with probe/disconnect that allocates
+ * the usbcam_dev + minidrv_data, registers the V4L2 device, and calls
+ * the minidriver ops.  Usage:
+ *
+ *   DEFINE_USBCAM_MINIDRV_MODULE(VERSION, VERSION_EXTRA,
+ *                                &my_dev_ops, sizeof(struct my_ctx), id_table)
  */
-static inline void usbcam_capture_stop_nondestructive(struct usbcam_dev *udp)
-{
-	if (udp->ud_capturing && list_empty(&udp->ud_frame_cap_queue))
-		usbcam_capture_stop(udp);
-}
+#define __usbcam_md_str(x) #x
 
-extern struct videobuf_queue_ops usbcam_videobuf_qops;
-extern struct v4l2_file_operations usbcam_v4l_fops_template;
-extern struct video_device usbcam_videodev_template;
+#define DEFINE_USBCAM_MINIDRV_MODULE(VERSION, VERSION_EXTRA, OPS, DATA_SIZE, ID_TABLE) \
+static int __usbcam_md_probe(struct usb_interface *intf, \
+			     const struct usb_device_id *devid) \
+{ \
+	struct usbcam_dev *udp; \
+	int ret; \
+	udp = kzalloc(sizeof(*udp) + DATA_SIZE, GFP_KERNEL); \
+	if (!udp) \
+		return -ENOMEM; \
+	udp->intf = intf; \
+	usb_set_intfdata(intf, udp); \
+	udp->udev = interface_to_usbdev(intf); \
+	udp->devid = devid; \
+	udp->dev = &intf->dev; \
+	udp->minidrv_data = (char *)udp + sizeof(*udp); \
+	udp->ops = OPS; \
+	ret = usbcam_register(udp, OPS, -1); \
+	if (ret) { \
+		kfree(udp); \
+		return ret; \
+	} \
+	if ((OPS)->init) { \
+		ret = (OPS)->init(udp); \
+		if (ret) { \
+			usbcam_unregister(udp); \
+			kfree(udp); \
+			return ret; \
+		} \
+	} \
+	return 0; \
+} \
+static void __usbcam_md_disconnect(struct usb_interface *intf) \
+{ \
+	struct usbcam_dev *udp = usb_get_intfdata(intf); \
+	if (!udp) \
+		return; \
+	if ((OPS)->exit) \
+		(OPS)->exit(udp); \
+	usbcam_unregister(udp); \
+	kfree(udp); \
+} \
+static struct usb_driver __usbcam_md_driver = { \
+	.name		= KBUILD_MODNAME, \
+	.probe		= __usbcam_md_probe, \
+	.disconnect	= __usbcam_md_disconnect, \
+	.id_table	= ID_TABLE, \
+}; \
+module_usb_driver(__usbcam_md_driver); \
+MODULE_VERSION(__usbcam_md_str(VERSION) VERSION_EXTRA)
 
-#endif  /* !defined(__USBCAM_PRIV_H__) */
+#endif /* __USBCAM_PRIV_H__ */
